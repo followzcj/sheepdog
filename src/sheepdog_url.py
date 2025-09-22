@@ -12,7 +12,15 @@ from sklearn.metrics import precision_recall_fscore_support as score
 from sklearn.metrics import accuracy_score
 from tqdm import tqdm
 
-sys.path.append(os.getcwd())
+#sys.path.append(os.getcwd())
+# 1. 获取当前脚本（sheepdog_url.py）的绝对路径
+current_script_path = os.path.abspath(__file__)
+# 2. 获取当前脚本所在目录（src文件夹）的路径
+src_dir = os.path.dirname(current_script_path)
+# 3. 获取src的上级目录（即项目根目录，utils就在这里）
+project_root = os.path.dirname(src_dir)
+# 4. 将项目根目录加入Python的路径搜索列表
+sys.path.append(project_root)
 from utils.load_data_url import *  # 包含load_webpages和load_reframing函数
 
 warnings.filterwarnings("ignore")
@@ -21,10 +29,9 @@ warnings.filterwarnings("ignore")
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset_name', default='web', type=str)
 parser.add_argument('--model_name', default='SheepDog-Web', type=str)
-parser.add_argument('--iters', default=2, type=int)
-parser.add_argument('--batch_size', default=1, type=int)
+parser.add_argument('--iters', default=3, type=int)
+parser.add_argument('--batch_size', default=4, type=int)
 parser.add_argument('--n_epochs', default=5, type=int)
-parser.add_argument('--max_len', default=256, type=int)  # 减小序列长度
 args = parser.parse_args()
 
 # 设备设置
@@ -696,7 +703,7 @@ if __name__ == '__main__':
 
     datasetname = args.dataset_name
     batch_size = args.batch_size
-    max_len = 128
+    max_len = 512
     tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
     n_epochs = args.n_epochs
     iterations = args.iters
