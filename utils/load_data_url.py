@@ -35,9 +35,9 @@ def load_webpages(obj):
 
     # 提取训练集和测试集的网页文本、URL和标签
     x_train, url_train, y_train = train_dict['news'], train_dict['url'], train_dict['labels']  # 网页文本、URL和对应标签
-    print(x_train, url_train, y_train)
+    # print(x_train, url_train, y_train)
     x_test, url_test, y_test = test_dict['news'], test_dict['url'], test_dict['labels']
-    print(x_test, url_test, y_test)
+    # print(x_test, url_test, y_test)
 
     # 提取对抗性测试集的网页文本
     x_test_res = restyle_dict['news']
