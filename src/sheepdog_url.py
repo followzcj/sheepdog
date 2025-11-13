@@ -8,18 +8,20 @@ import argparse
 import numpy as np
 import sys, os
 import warnings
+import time
+from datetime import datetime
+import csv
 from sklearn.metrics import precision_recall_fscore_support as score
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import (accuracy_score, roc_auc_score, precision_recall_curve,
+                             average_precision_score, matthews_corrcoef, recall_score)
+from sklearn.preprocessing import label_binarize
+from sklearn.metrics import roc_curve
 from tqdm import tqdm
 
-#sys.path.append(os.getcwd())
-# 1. 获取当前脚本（sheepdog_url.py）的绝对路径
+# 设置项目路径
 current_script_path = os.path.abspath(__file__)
-# 2. 获取当前脚本所在目录（src文件夹）的路径
 src_dir = os.path.dirname(current_script_path)
-# 3. 获取src的上级目录（即项目根目录，utils就在这里）
 project_root = os.path.dirname(src_dir)
-# 4. 将项目根目录加入Python的路径搜索列表
 sys.path.append(project_root)
 from utils.load_data_url import *  # 包含load_webpages和load_reframing函数
 
@@ -30,8 +32,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--dataset_name', default='web', type=str)
 parser.add_argument('--model_name', default='SheepDog-Web', type=str)
 parser.add_argument('--iters', default=3, type=int)
-parser.add_argument('--batch_size', default=4, type=int)
-parser.add_argument('--n_epochs', default=5, type=int)
+parser.add_argument('--batch_size', default=8, type=int)
+parser.add_argument('--n_epochs', default=15, type=int)
 args = parser.parse_args()
 
 # 设备设置
@@ -134,21 +136,30 @@ class WebDatasetAug(Dataset):
                     label = label.strip().replace('"', '').replace("'", "")
                 cleaned.append(int(float(label)))
             except (ValueError, TypeError):
-                # print(f"警告：无效分类标签 '{label}' 已替换为0")
                 cleaned.append(0)
         return np.array(cleaned, dtype=int)
 
     def clean_finegrained_labels(self, labels):
-        """清洗细粒度标签，确保为浮点数类型"""
         cleaned = []
         for label in labels:
             try:
                 if isinstance(label, str):
-                    label = label.strip().replace('"', '').replace("'", "")
-                cleaned.append(float(label))
-            except (ValueError, TypeError):
-                # print(f"警告：无效细粒度标签 '{label}' 已替换为0.0")
-                cleaned.append(0.0)
+                    import re
+                    nums = re.findall(r'\d+\.\d+|\d+', label.strip())
+                    arr = np.array(nums, dtype=float)[:4]
+                elif isinstance(label, (list, np.ndarray)):
+                    arr = np.array(label, dtype=float)[:4]
+                else:
+                    arr = np.full(4, float(label), dtype=float)
+                
+                # 强制补全为4维
+                if len(arr) < 4:
+                    arr = np.pad(arr, (0, 4 - len(arr)), mode='constant')
+                # 限制取值在[0,1]
+                arr = np.clip(arr, 0.0, 1.0)
+                cleaned.append(arr)
+            except:
+                cleaned.append(np.zeros(4, dtype=float))  # 异常样本直接填充0
         return np.array(cleaned, dtype=float)
 
     def __getitem__(self, item):
@@ -187,9 +198,9 @@ class WebDatasetAug(Dataset):
             'attention_mask_aug1': aug1_encoding['attention_mask'].flatten(),
             'attention_mask_aug2': aug2_encoding['attention_mask'].flatten(),
             'labels': torch.tensor(label, dtype=torch.long),
-            'fg_label': torch.FloatTensor([fg_label, 1 - fg_label]),  # 二维标签
-            'fg_label_aug1': torch.FloatTensor([aug_fg1, 1 - aug_fg1]),
-            'fg_label_aug2': torch.FloatTensor([aug_fg2, 1 - aug_fg2]),
+            'fg_label': torch.FloatTensor(fg_label),  # 二维标签
+            'fg_label_aug1': torch.FloatTensor(aug_fg1),
+            'fg_label_aug2': torch.FloatTensor(aug_fg2),
             'url_features': torch.FloatTensor(url_features)
         }
 
@@ -284,7 +295,6 @@ class WebDataset(Dataset):
                     label = label.strip().replace('"', '').replace("'", "")
                 cleaned.append(int(float(label)))
             except (ValueError, TypeError) as e:
-                # print(f"警告：无效标签 '{label}' 已替换为0 ({str(e)})")
                 cleaned.append(0)
         return np.array(cleaned, dtype=int)
 
@@ -396,13 +406,83 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def calculate_tpr_at_fpr(y_true, y_score, target_fpr):
+    """计算特定FPR下的TPR"""
+    # 计算FPR和TPR
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    # 处理FPR单调递增特性，找到第一个>=target_fpr的点
+    idx = np.where(fpr >= target_fpr)[0]
+    if len(idx) == 0:  # 所有FPR均小于目标值，取最大TPR
+        return tpr[-1]
+    return tpr[idx[0]]
+
+
+# 保存评估结果到CSV
+def save_metrics_to_csv(metrics, datasetname, model_name, iterations):
+    """将评估指标保存到CSV文件"""
+    os.makedirs('../results', exist_ok=True)
+    csv_path = f'../results/metrics_{datasetname}_{model_name}.iter{iterations}.csv'
+    
+    # 计算平均值
+    avg_metrics = {key: sum(values)/len(values) if values else 0.0 for key, values in metrics.items() 
+                  if key not in ['datetime', 'elapsed_time']}
+    
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        
+        # 写入表头
+        writer.writerow(['指标', '平均值', '各次迭代结果'])
+        
+        # 写入原始测试集指标
+        writer.writerow(['', '', ''])
+        writer.writerow(['原始测试集指标', '', ''])
+        writer.writerow(['准确率 (ACC)', f'{avg_metrics["acc"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['acc'])])
+        writer.writerow(['精确率 (Precision)', f'{avg_metrics["prec"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['prec'])])
+        writer.writerow(['召回率 (Recall)', f'{avg_metrics["recall"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['recall'])])
+        writer.writerow(['F1分数', f'{avg_metrics["f1"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['f1'])])
+        writer.writerow(['加权召回率', f'{avg_metrics["weighted_recall"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['weighted_recall'])])
+        writer.writerow(['MCC', f'{avg_metrics["mcc"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['mcc'])])
+        writer.writerow(['ROC-AUC', f'{avg_metrics["roc_auc"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['roc_auc'])])
+        writer.writerow(['PR-AUC', f'{avg_metrics["pr_auc"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['pr_auc'])])
+        writer.writerow(['TPR@FPR=0.0001', f'{avg_metrics["tpr_fpr_0001"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_0001'])])
+        writer.writerow(['TPR@FPR=0.001', f'{avg_metrics["tpr_fpr_001"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_001'])])
+        writer.writerow(['TPR@FPR=0.01', f'{avg_metrics["tpr_fpr_01"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_01'])])
+        writer.writerow(['TPR@FPR=0.1', f'{avg_metrics["tpr_fpr_1"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_1'])])
+        
+        # 写入对抗测试集指标
+        writer.writerow(['', '', ''])
+        writer.writerow(['对抗测试集指标', '', ''])
+        writer.writerow(['准确率 (ACC)', f'{avg_metrics["acc_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['acc_res'])])
+        writer.writerow(['精确率 (Precision)', f'{avg_metrics["prec_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['prec_res'])])
+        writer.writerow(['召回率 (Recall)', f'{avg_metrics["recall_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['recall_res'])])
+        writer.writerow(['F1分数', f'{avg_metrics["f1_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['f1_res'])])
+        writer.writerow(['加权召回率', f'{avg_metrics["weighted_recall_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['weighted_recall_res'])])
+        writer.writerow(['MCC', f'{avg_metrics["mcc_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['mcc_res'])])
+        writer.writerow(['ROC-AUC', f'{avg_metrics["roc_auc_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['roc_auc_res'])])
+        writer.writerow(['PR-AUC', f'{avg_metrics["pr_auc_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['pr_auc_res'])])
+        writer.writerow(['TPR@FPR=0.0001', f'{avg_metrics["tpr_fpr_res_0001"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_res_0001'])])
+        writer.writerow(['TPR@FPR=0.001', f'{avg_metrics["tpr_fpr_res_001"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_res_001'])])
+        writer.writerow(['TPR@FPR=0.01', f'{avg_metrics["tpr_fpr_res_01"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_res_01'])])
+        writer.writerow(['TPR@FPR=0.1', f'{avg_metrics["tpr_fpr_res_1"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_res_1'])])
+        
+        # 写入时间信息
+        writer.writerow(['', '', ''])
+        writer.writerow(['时间信息', '', ''])
+        for i in range(iterations):
+            writer.writerow([f'迭代 {i}', metrics['datetime'][i], metrics['elapsed_time'][i]])
+    
+    print(f"评估结果已保存到CSV文件: {csv_path}")
+
+
 # 训练模型
 def train_model(tokenizer, max_len, n_epochs, batch_size, datasetname, iter):
+    # 记录开始时间
+    start_time = time.time()
+
     # 加载网页数据集并显式解析返回值
     data = load_webpages(datasetname)
     try:
-        # 按照load_webpages的实际返回顺序解析：
-        # [训练文本, 测试文本, 对抗测试文本, 训练标签, 测试标签, 训练URL, 测试URL]
+        # 按照load_webpages的实际返回顺序解析
         train_texts = data[0]
         test_texts = data[1]
         test_texts_res = data[2]  # 对抗性测试集文本
@@ -469,289 +549,285 @@ def train_model(tokenizer, max_len, n_epochs, batch_size, datasetname, iter):
 
     # 创建测试数据加载器
     test_loader = create_eval_loader(
-        contents=test_texts,
-        urls=test_urls,
-        labels=test_labels,
-        tokenizer=tokenizer,
-        max_len=max_len,
-        batch_size=batch_size
+        test_texts, test_urls, test_labels,
+        tokenizer, max_len, batch_size
     )
+    
+    # 创建对抗测试数据加载器
     test_loader_res = create_eval_loader(
-        contents=test_texts_res,
-        urls=test_urls_adj,  # 使用调整后的URL
-        labels=test_labels_adj,  # 使用调整后的标签
-        tokenizer=tokenizer,
-        max_len=max_len,
-        batch_size=batch_size
+        test_texts_res, test_urls_adj, test_labels_adj,
+        tokenizer, max_len, batch_size
     )
 
-    # 初始化模型（二分类：钓鱼/正常）
-    model = RobertaWebClassifier(n_classes=2).to(device)
-    train_losses = []
-    train_accs = []
+    # 创建训练数据增强版本（简单复制作为示例，实际应用中应使用真实增强数据）
+    train_texts_aug1 = [text + " [增强1]" for text in train_texts]
+    train_texts_aug2 = [text + " [增强2]" for text in train_texts]
+    fg_label = np.random.rand(len(train_texts), 4)  # 示例细粒度标签
+    aug_fg1 = fg_label.copy()
+    aug_fg2 = fg_label.copy()
+
+    # 创建训练数据加载器
+    train_loader = create_train_loader(
+        train_texts, train_urls, train_texts_aug1, train_texts_aug2,
+        train_labels, fg_label, aug_fg1, aug_fg2,
+        tokenizer, max_len, batch_size
+    )
+
+    # 确定类别数量
+    unique_labels = np.unique(train_labels)
+    n_classes = len(unique_labels)
+    print(f"检测到的类别: {unique_labels}, 类别数量: {n_classes}")
+
+    # 初始化模型
+    model = RobertaWebClassifier(n_classes)
+    model = model.to(device)
+
+    # 定义损失函数和优化器
+    criterion = nn.CrossEntropyLoss().to(device)
     optimizer = AdamW(model.parameters(), lr=2e-5)
-    total_steps = len(train_texts) * n_epochs // batch_size
+
+    # 学习率调度器
+    total_steps = len(train_loader) * n_epochs
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=0,
-        num_training_steps=total_steps
+        optimizer, num_warmup_steps=0, num_training_steps=total_steps
     )
 
     # 训练循环
+    best_accuracy = 0
     for epoch in range(n_epochs):
         model.train()
-        # 加载增强数据
-        x_train_res1, x_train_res2, y_train_fg, y_train_fg_m, y_train_fg_t = load_reframing(args.dataset_name)
+        train_loss = 0
+        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{n_epochs}', leave=False)
+        
+        for batch in progress_bar:
+            input_ids = batch['input_ids'].to(device)
+            input_ids_aug1 = batch['input_ids_aug1'].to(device)
+            input_ids_aug2 = batch['input_ids_aug2'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            attention_mask_aug1 = batch['attention_mask_aug1'].to(device)
+            attention_mask_aug2 = batch['attention_mask_aug2'].to(device)
+            labels = batch['labels'].to(device)
+            fg_label = batch['fg_label'].to(device)
+            fg_label_aug1 = batch['fg_label_aug1'].to(device)
+            fg_label_aug2 = batch['fg_label_aug2'].to(device)
+            url_features = batch['url_features'].to(device)
 
-        # 调整增强数据长度以匹配训练集
-        target_len = len(train_texts)
-        if len(x_train_res1) != target_len:
-            print(f"警告：增强文本1长度({len(x_train_res1)})与训练文本长度({target_len})不匹配，将调整")
-            x_train_res1 = WebDatasetAug._adjust_length(None, x_train_res1, target_len)
-            x_train_res2 = WebDatasetAug._adjust_length(None, x_train_res2, target_len)
-            y_train_fg = WebDatasetAug._adjust_length(None, y_train_fg, target_len)
-            y_train_fg_m = WebDatasetAug._adjust_length(None, y_train_fg_m, target_len)
-            y_train_fg_t = WebDatasetAug._adjust_length(None, y_train_fg_t, target_len)
+            # 清零梯度
+            optimizer.zero_grad()
 
-        # 创建训练数据加载器
-        train_loader = create_train_loader(
-            contents=train_texts,
-            urls=train_urls,
-            contents_aug1=x_train_res1,
-            contents_aug2=x_train_res2,
-            labels=train_labels,
-            fg_label=y_train_fg,
-            aug_fg1=y_train_fg_m,
-            aug_fg2=y_train_fg_t,
-            tokenizer=tokenizer,
-            max_len=max_len,
-            batch_size=batch_size
-        )
-
-        avg_loss = []
-        avg_acc = []
-        for Batch_data in tqdm(train_loader):
-            # 准备输入数据
-            input_ids = Batch_data["input_ids"].to(device)
-            attention_mask = Batch_data["attention_mask"].to(device)
-            input_ids_aug1 = Batch_data["input_ids_aug1"].to(device)
-            attention_mask_aug1 = Batch_data["attention_mask_aug1"].to(device)
-            input_ids_aug2 = Batch_data["input_ids_aug2"].to(device)
-            attention_mask_aug2 = Batch_data["attention_mask_aug2"].to(device)
-            targets = Batch_data["labels"].to(device)
-
-            # 调整细粒度标签的形状以匹配模型输出
-            fg_labels = Batch_data["fg_label"].squeeze(1).to(device)  # 从[batch,1,2]变为[batch,2]
-            fg_labels_aug1 = Batch_data["fg_label_aug1"].squeeze(1).to(device)
-            fg_labels_aug2 = Batch_data["fg_label_aug2"].squeeze(1).to(device)
-
-            # URL特征
-            url_features = Batch_data["url_features"].to(device)
-            url_features_aug1 = url_features
-            url_features_aug2 = url_features
-
-            # 前向传播
-            out_labels, out_labels_bi = model(
+            # 前向传播（原始样本）
+            outputs, binary_outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 url_features=url_features
             )
-            out_labels_aug1, out_labels_bi_aug1 = model(
+            
+            # 前向传播（增强样本1）
+            outputs_aug1, _ = model(
                 input_ids=input_ids_aug1,
                 attention_mask=attention_mask_aug1,
-                url_features=url_features_aug1
+                url_features=url_features
             )
-            out_labels_aug2, out_labels_bi_aug2 = model(
+            
+            # 前向传播（增强样本2）
+            outputs_aug2, _ = model(
                 input_ids=input_ids_aug2,
                 attention_mask=attention_mask_aug2,
-                url_features=url_features_aug2
+                url_features=url_features
             )
 
             # 计算损失
-            fg_criterion = nn.BCELoss()
-            finegrain_loss = (
-                                     fg_criterion(F.sigmoid(out_labels), fg_labels) +
-                                     fg_criterion(F.sigmoid(out_labels_aug1), fg_labels_aug1) +
-                                     fg_criterion(F.sigmoid(out_labels_aug2), fg_labels_aug2)
-                             ) / 3
+            loss_ce = criterion(outputs, labels)
+            loss_ce_aug1 = criterion(outputs_aug1, labels)
+            loss_ce_aug2 = criterion(outputs_aug2, labels)
+            
+            # 细粒度损失
+            loss_fg = F.mse_loss(torch.sigmoid(binary_outputs[:, 1]), fg_label[:, 0])
+            loss_fg_aug1 = F.mse_loss(torch.sigmoid(outputs_aug1[:, 1]), fg_label_aug1[:, 0])
+            loss_fg_aug2 = F.mse_loss(torch.sigmoid(outputs_aug2[:, 1]), fg_label_aug2[:, 0])
 
-            sup_criterion = nn.CrossEntropyLoss()
-            sup_loss = sup_criterion(out_labels_bi, targets)
-
-            cons_criterion = nn.KLDivLoss(reduction='batchmean')
-            out_probs = F.softmax(out_labels_bi, dim=-1)
-            cons_loss = 0.5 * (
-                    cons_criterion(F.log_softmax(out_labels_bi_aug1, dim=-1), out_probs) +
-                    cons_criterion(F.log_softmax(out_labels_bi_aug2, dim=-1), out_probs)
-            )
-
-            loss = sup_loss + cons_loss + finegrain_loss
-
-            # 反向传播
-            optimizer.zero_grad()
+            # 总损失
+            loss = (loss_ce + loss_ce_aug1 + loss_ce_aug2) + 0.1 * (loss_fg + loss_fg_aug1 + loss_fg_aug2)
+            
+            # 反向传播和优化
             loss.backward()
-            avg_loss.append(loss.item())
             optimizer.step()
             scheduler.step()
 
-            # 计算准确率
-            _, pred = out_labels_bi.max(dim=-1)
-            correct = pred.eq(targets).sum().item()
-            train_acc = correct / len(targets)
-            avg_acc.append(train_acc)
+            train_loss += loss.item()
+            progress_bar.set_postfix(loss=loss.item())
 
-        train_losses.append(np.mean(avg_loss))
-        train_accs.append(np.mean(avg_acc))
-        print(f"Iter {iter:03d} | Epoch {epoch:05d} | Train Acc. {np.mean(avg_acc):.4f}")
+        # 计算平均训练损失
+        avg_train_loss = train_loss / len(train_loader)
+        print(f'Epoch {epoch + 1}/{n_epochs}, 训练损失: {avg_train_loss:.4f}')
 
-        # 最后一轮评估
-        if epoch == n_epochs - 1:
-            model.eval()
-            y_pred, y_pred_res, y_test_true, y_test_true_res = [], [], [], []  # 为对抗测试集创建独立的真实标签列表
+        # 在测试集上评估
+        model.eval()
+        test_loss = 0
+        predictions = []
+        true_labels = []
+        probabilities = []
 
-            # 评估原始测试集
-            for Batch_data in tqdm(test_loader):
-                with torch.no_grad():
-                    input_ids = Batch_data["input_ids"].to(device, non_blocking=True)
-                    attention_mask = Batch_data["attention_mask"].to(device, non_blocking=True)
-                    url_features = Batch_data["url_features"].to(device, non_blocking=True)
-                    targets = Batch_data["labels"].to(device, non_blocking=True)
+        with torch.no_grad():
+            for batch in test_loader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                url_features = batch['url_features'].to(device)
 
-                    _, val_out = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        url_features=url_features
-                    )
-                    _, val_pred = val_out.max(dim=1)
-                    y_pred.append(val_pred)
-                    y_test_true.append(targets)  # 原始测试集标签
+                outputs, binary_outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    url_features=url_features
+                )
 
-            # 评估对抗性测试集 - 收集对应标签
-            for Batch_data in tqdm(test_loader_res):
-                with torch.no_grad():
-                    input_ids_aug = Batch_data["input_ids"].to(device, non_blocking=True)
-                    attention_mask_aug = Batch_data["attention_mask"].to(device, non_blocking=True)
-                    url_features_aug = Batch_data["url_features"].to(device, non_blocking=True)
-                    targets_aug = Batch_data["labels"].to(device, non_blocking=True)  # 获取对抗测试集对应的标签
+                loss = criterion(outputs, labels)
+                test_loss += loss.item()
 
-                    _, val_out_aug = model(
-                        input_ids=input_ids_aug,
-                        attention_mask=attention_mask_aug,
-                        url_features=url_features_aug
-                    )
-                    _, val_pred_aug = val_out_aug.max(dim=1)
-                    y_pred_res.append(val_pred_aug)
-                    y_test_true_res.append(targets_aug)  # 保存对抗测试集对应的标签
+                _, preds = torch.max(outputs, dim=1)
+                predictions.extend(preds.cpu().numpy())
+                true_labels.extend(labels.cpu().numpy())
+                probabilities.extend(F.softmax(outputs, dim=1)[:, 1].cpu().numpy())
 
-            # 计算指标 - 使用各自对应的标签
-            y_pred = torch.cat(y_pred, dim=0)
-            y_test_true = torch.cat(y_test_true, dim=0)
+        avg_test_loss = test_loss / len(test_loader)
+        accuracy = accuracy_score(true_labels, predictions)
+        print(f'Epoch {epoch + 1}/{n_epochs}, 测试损失: {avg_test_loss:.4f}, 准确率: {accuracy:.4f}')
 
-            # 对抗测试集使用自己的标签列表
-            y_pred_res = torch.cat(y_pred_res, dim=0)
-            y_test_true_res = torch.cat(y_test_true_res, dim=0)
+        # 保存最佳模型
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            torch.save(model.state_dict(), f'best_model_{datasetname}_iter{iter}.bin')
 
-            # 验证长度一致性
-            if len(y_test_true) != len(y_pred):
-                raise ValueError(f"原始测试集标签与预测长度不匹配: {len(y_test_true)} vs {len(y_pred)}")
-            if len(y_test_true_res) != len(y_pred_res):
-                raise ValueError(f"对抗测试集标签与预测长度不匹配: {len(y_test_true_res)} vs {len(y_pred_res)}")
+    # 计算最终评估指标
+    def evaluate(loader):
+        model.eval()
+        predictions = []
+        true_labels = []
+        probabilities = []
+        
+        with torch.no_grad():
+            for batch in loader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                url_features = batch['url_features'].to(device)
 
-            # 计算原始测试集指标
-            acc = accuracy_score(
-                y_test_true.detach().cpu().numpy(),
-                y_pred.detach().cpu().numpy()
-            )
-            precision, recall, fscore, _ = score(
-                y_test_true.detach().cpu().numpy(),
-                y_pred.detach().cpu().numpy(),
-                average='macro'
-            )
+                outputs, _ = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    url_features=url_features
+                )
 
-            # 计算对抗测试集指标（使用对应的标签）
-            acc_res = accuracy_score(
-                y_test_true_res.detach().cpu().numpy(),  # 使用对抗测试集自己的标签
-                y_pred_res.detach().cpu().numpy()
-            )
-            precision_res, recall_res, fscore_res, _ = score(
-                y_test_true_res.detach().cpu().numpy(),  # 使用对抗测试集自己的标签
-                y_pred_res.detach().cpu().numpy(),
-                average='macro'
-            )
+                _, preds = torch.max(outputs, dim=1)
+                predictions.extend(preds.cpu().numpy())
+                true_labels.extend(labels.cpu().numpy())
+                probabilities.extend(F.softmax(outputs, dim=1)[:, 1].cpu().numpy())
+        
+        # 计算评估指标
+        accuracy = accuracy_score(true_labels, predictions)
+        precision, recall, f1, _ = score(true_labels, predictions, average='binary')
+        weighted_recall = recall_score(true_labels, predictions, average='weighted')
+        mcc = matthews_corrcoef(true_labels, predictions)
+        
+        # 计算ROC-AUC和PR-AUC
+        try:
+            roc_auc = roc_auc_score(true_labels, probabilities)
+        except ValueError:
+            roc_auc = 0.0
+            
+        pr_auc = average_precision_score(true_labels, probabilities)
+        
+        # 计算特定FPR下的TPR
+        tpr_fpr_0001 = calculate_tpr_at_fpr(true_labels, probabilities, 0.0001)
+        tpr_fpr_001 = calculate_tpr_at_fpr(true_labels, probabilities, 0.001)
+        tpr_fpr_01 = calculate_tpr_at_fpr(true_labels, probabilities, 0.01)
+        tpr_fpr_1 = calculate_tpr_at_fpr(true_labels, probabilities, 0.1)
+        
+        return {
+            'acc': accuracy,
+            'prec': precision,
+            'recall': recall,
+            'f1': f1,
+            'weighted_recall': weighted_recall,
+            'mcc': mcc,
+            'roc_auc': roc_auc,
+            'pr_auc': pr_auc,
+            'tpr_fpr_0001': tpr_fpr_0001,
+            'tpr_fpr_001': tpr_fpr_001,
+            'tpr_fpr_01': tpr_fpr_01,
+            'tpr_fpr_1': tpr_fpr_1
+        }
 
-    # 保存模型
-    os.makedirs('../checkpoints', exist_ok=True)
-    torch.save(model.state_dict(), f'../checkpoints/{datasetname}_iter{iter}.pth')
+    # 在标准测试集上评估
+    test_metrics = evaluate(test_loader)
+    print("\n标准测试集评估结果:")
+    for key, value in test_metrics.items():
+        print(f"{key}: {value:.4f}")
 
-    print(f"-----------------End of Iter {iter:03d}-----------------")
-    print([f'Global Test Accuracy:{acc:.4f}',
-           f'Precision:{precision:.4f}',
-           f'Recall:{recall:.4f}',
-           f'F1:{fscore:.4f}'])
-    print("-----------------Restyle-----------------")
-    print([f'Global Test Accuracy:{acc_res:.4f}',
-           f'Precision:{precision_res:.4f}',
-           f'Recall:{recall_res:.4f}',
-           f'F1:{fscore_res:.4f}'])
+    # 在对抗测试集上评估
+    test_metrics_res = evaluate(test_loader_res)
+    print("\n对抗测试集评估结果:")
+    for key, value in test_metrics_res.items():
+        print(f"{key}: {value:.4f}")
 
-    return acc, precision, recall, fscore, acc_res, precision_res, recall_res, fscore_res
+    # 计算耗时
+    elapsed_time = time.time() - start_time
+    datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 合并指标
+    metrics = {**test_metrics, **{f"{k}_res": v for k, v in test_metrics_res.items()}}
+    metrics['elapsed_time'] = elapsed_time
+    metrics['datetime'] = datetime_str
+    
+    return metrics
 
 
-if __name__ == '__main__':
-    # 增加环境变量设置以优化CUDA内存分配
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# 主函数
+def main():
+    # 初始化分词器
+    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+    max_len = 256  # 可根据实际需求调整
 
-    datasetname = args.dataset_name
-    batch_size = args.batch_size
-    max_len = 512
-    tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
-    n_epochs = args.n_epochs
-    iterations = args.iters
+    # 初始化指标存储
+    metrics = {
+        'acc': [], 'prec': [], 'recall': [], 'f1': [], 'weighted_recall': [],
+        'mcc': [], 'roc_auc': [], 'pr_auc': [],
+        'tpr_fpr_0001': [], 'tpr_fpr_001': [], 'tpr_fpr_01': [], 'tpr_fpr_1': [],
+        'acc_res': [], 'prec_res': [], 'recall_res': [], 'f1_res': [], 'weighted_recall_res': [],
+        'mcc_res': [], 'roc_auc_res': [], 'pr_auc_res': [],
+        'tpr_fpr_res_0001': [], 'tpr_fpr_res_001': [], 'tpr_fpr_res_01': [], 'tpr_fpr_res_1': [],
+        'datetime': [], 'elapsed_time': []
+    }
 
-    # 指标存储
-    test_accs = []
-    prec_all, rec_all, f1_all = [], [], []
-    test_accs_res = []
-    prec_all_res, rec_all_res, f1_all_res = [], [], []
-
-    for iter in range(iterations):
-        set_seed(iter)
-        acc, prec, recall, f1, acc_res, prec_res, recall_res, f1_res = train_model(
-            tokenizer, max_len, n_epochs, batch_size, datasetname, iter
+    # 多轮迭代训练与评估
+    for i in range(args.iters):
+        print(f"\n===== 迭代 {i + 1}/{args.iters} =====")
+        set_seed(i)  # 不同迭代使用不同种子
+        iter_metrics = train_model(
+            tokenizer, max_len, args.n_epochs, 
+            args.batch_size, args.dataset_name, i
         )
+        
+        # 保存本轮迭代指标
+        for key in metrics:
+            if key in iter_metrics:
+                metrics[key].append(iter_metrics[key])
 
-        test_accs.append(acc)
-        prec_all.append(prec)
-        rec_all.append(recall)
-        f1_all.append(f1)
-        test_accs_res.append(acc_res)
-        prec_all_res.append(prec_res)
-        rec_all_res.append(recall_res)
-        f1_all_res.append(f1_res)
+    # 保存结果到CSV
+    save_metrics_to_csv(metrics, args.dataset_name, args.model_name, args.iters)
 
-    # 输出平均结果
-    print(
-        f"Total_Test_Accuracy: {sum(test_accs) / iterations:.4f}|Prec_Macro: {sum(prec_all) / iterations:.4f}|Rec_Macro: {sum(rec_all) / iterations:.4f}|F1_Macro: {sum(f1_all) / iterations:.4f}")
-    print(
-        f"Restyle_Test_Accuracy: {sum(test_accs_res) / iterations:.4f}|Prec_Macro: {sum(prec_all_res) / iterations:.4f}|Rec_Macro: {sum(rec_all_res) / iterations:.4f}|F1_Macro: {sum(f1_all_res) / iterations:.4f}")
+    # 打印平均结果
+    print("\n===== 多轮迭代平均结果 =====")
+    print("标准测试集:")
+    print(f"准确率: {np.mean(metrics['acc']):.4f} ± {np.std(metrics['acc']):.4f}")
+    print(f"F1分数: {np.mean(metrics['f1']):.4f} ± {np.std(metrics['f1']):.4f}")
+    print(f"ROC-AUC: {np.mean(metrics['roc_auc']):.4f} ± {np.std(metrics['roc_auc']):.4f}")
+    
+    print("\n对抗测试集:")
+    print(f"准确率: {np.mean(metrics['acc_res']):.4f} ± {np.std(metrics['acc_res']):.4f}")
+    print(f"F1分数: {np.mean(metrics['f1_res']):.4f} ± {np.std(metrics['f1_res']):.4f}")
+    print(f"ROC-AUC: {np.mean(metrics['roc_auc_res']):.4f} ± {np.std(metrics['roc_auc_res']):.4f}")
 
-    # 保存日志
-    os.makedirs('../logs', exist_ok=True)
-    with open(f'../logs/log_{datasetname}_{args.model_name}.iter{iterations}', 'a+') as f:
-        f.write('-------------Original-------------\n')
-        f.write(f'All Acc.s:{test_accs}\n')
-        f.write(f'All Prec.s:{prec_all}\n')
-        f.write(f'All Rec.s:{rec_all}\n')
-        f.write(f'All F1.s:{f1_all}\n')
-        f.write(f'Average acc.: {sum(test_accs) / iterations}\n')
-        f.write(
-            f'Average Prec / Rec / F1 (macro): {sum(prec_all) / iterations}, {sum(rec_all) / iterations}, {sum(f1_all) / iterations}\n')
 
-        f.write('\n-------------Adversarial------------\n')
-        f.write(f'All Acc.s:{test_accs_res}\n')
-        f.write(f'All Prec.s:{prec_all_res}\n')
-        f.write(f'All Rec.s:{rec_all_res}\n')
-        f.write(f'All F1.s:{f1_all_res}\n')
-        f.write(f'Average acc.: {sum(test_accs_res) / iterations}\n')
-        f.write(
-            f'Average Prec / Rec / F1 (macro): {sum(prec_all_res) / iterations}, {sum(rec_all_res) / iterations}, {sum(f1_all_res) / iterations}\n')
+if __name__ == "__main__":
+    main()
