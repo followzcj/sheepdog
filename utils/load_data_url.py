@@ -34,13 +34,13 @@ def load_webpages(obj):
     # 注：可根据需要切换到其他对抗测试集文件，如 '_test_adv_B.pkl'、'_test_adv_C.pkl' 等
 
     # 提取训练集和测试集的网页文本、URL和标签
-    x_train, url_train, y_train = train_dict['news'], train_dict['url'], train_dict['labels']  # 网页文本、URL和对应标签
+    x_train, url_train, y_train = train_dict['html'], train_dict['url'], train_dict['labels']  # 网页文本、URL和对应标签
     # print(x_train, url_train, y_train)
-    x_test, url_test, y_test = test_dict['news'], test_dict['url'], test_dict['labels']
+    x_test, url_test, y_test = test_dict['html'], test_dict['url'], test_dict['labels']
     # print(x_test, url_test, y_test)
 
     # 提取对抗性测试集的网页文本
-    x_test_res = restyle_dict['news']
+    x_test_res = restyle_dict['html']
 
     # 返回训练集、测试集、对抗测试集以及对应的URL和标签
     return x_train, x_test, x_test_res, y_train, y_test, url_train, url_test

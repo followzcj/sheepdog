@@ -7,19 +7,18 @@
 # software: PyCharm
 
 """
-this is function  description
+this is function description
 用来提取网站中的内容并打上标签然后存储为pkl文件
 真假性标签ft需自己更改为0或1，0为真，1为假
 读取数据量datanum
 """
-
-# import module your need
 
 import json
 import pickle
 import os
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+
 
 def load_json_files(json_dir):
     """读取文件夹下所有JSON文件，提取url、html_text和label"""
@@ -46,33 +45,50 @@ def load_json_files(json_dir):
                     print(f"解析错误：{filename}")
     return data
 
-def process_json_to_pkl(json_dir, output_dir, test_size=0.2):
-    """将JSON数据转换为模型所需的pkl格式（直接使用自带的label）"""
-    raw_data = load_json_files(json_dir)
-    print(f"共加载 {len(raw_data)} 条有效数据")
 
-    # 直接提取JSON中的字段（无需手动标注label）
-    texts = [item['html_text'] for item in raw_data]
-    urls = [item['url'] for item in raw_data]
-    labels = [item['label'] for item in raw_data]  # 关键：使用自带的label
+def process_json_to_pkl(json_dir, output_dir, test_size=0.2, max_news_length=0):
+    """将JSON数据转换为模型所需的pkl格式（直接使用自带的label），并过滤超长文本"""
+    raw_data = load_json_files(json_dir)
+    total_count = len(raw_data)
+    print(f"共加载 {total_count} 条有效数据")
+
+    # 过滤掉news（html_text）长度超过max_news_length的数据
+    filtered_data = []
+    filtered_count = 0  # 统计被过滤的数据条数
+    for item in raw_data:
+        if len(item['html_text']) <= max_news_length:
+            filtered_data.append(item)
+        else:
+            filtered_count += 1
+            # 可选：打印被过滤的数据信息
+            # print(f"过滤超长文本（长度：{len(item['html_text'])}），URL：{item['url']}")
+
+    # 打印过滤统计信息
+    print(f"过滤掉 {filtered_count} 条超长数据（长度超过{max_news_length}）")
+    print(f"过滤后剩余 {len(filtered_data)} 条数据")
+
+    # 提取过滤后的数据
+    texts = [item['html_text'] for item in filtered_data]
+    urls = [item['url'] for item in filtered_data]
+    labels = [item['label'] for item in filtered_data]
 
     # 划分训练集和测试集
     train_texts, test_texts, train_labels, test_labels = train_test_split(
-        texts, labels, test_size=test_size, random_state=42, stratify=labels  # 按label分层抽样
+        texts, labels, test_size=test_size, random_state=42, stratify=labels
     )
     train_urls, test_urls, _, _ = train_test_split(
         urls, labels, test_size=test_size, random_state=42, stratify=labels
     )
 
-    # 保存为与原代码兼容的pkl格式
+    # 保存为pkl格式
     os.makedirs(output_dir, exist_ok=True)
     train_data = {
-        'news': train_texts,  # 对应html_text
+        'html': train_texts,
         'url': train_urls,
         'labels': train_labels
     }
     test_data = {
-        'news': test_texts,
+        'html': test_texts,
         'url': test_urls,
         'labels': test_labels
     }
@@ -83,15 +99,8 @@ def process_json_to_pkl(json_dir, output_dir, test_size=0.2):
         pickle.dump(test_data, f)
     print(f"训练集 {len(train_texts)} 条，测试集 {len(test_texts)} 条已保存至 {output_dir}")
 
+
 if __name__ == "__main__":
-    json_dir = r"E:\1study\papers\Cyber Security\Fake News in Sheep’s Clothing——Robust Fake News Detection Against " \
-               r"LLM-Empowered Style Attacks\dataset"  # 你的JSON文件目录
-    output_dir = "../data/web_articles"   # 输出pkl文件路径（与原代码数据目录结构一致）
+    json_dir = r"E:\1study\papers\Cyber_Security\sheepdog\dataset\2000json"  # 你的JSON文件目录
+    output_dir = "../data/web_articles"  # 输出pkl文件路径
     process_json_to_pkl(json_dir, output_dir)
-
-
-
-
-
-
-
