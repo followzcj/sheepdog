@@ -1,833 +1,659 @@
+import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from transformers import RobertaModel, RobertaTokenizer, get_linear_schedule_with_warmup
+from transformers import RobertaTokenizer, RobertaModel, get_linear_schedule_with_warmup
 from torch.optim import AdamW
-import argparse
 import numpy as np
-import sys, os
-import warnings
-import time
-from datetime import datetime
-import csv
-from sklearn.metrics import precision_recall_fscore_support as score
-from sklearn.metrics import (accuracy_score, roc_auc_score, precision_recall_curve,
-                             average_precision_score, matthews_corrcoef, recall_score)
-from sklearn.preprocessing import label_binarize
-from sklearn.metrics import roc_curve
 from tqdm import tqdm
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, classification_report, roc_auc_score,
+    precision_recall_curve, auc, matthews_corrcoef
+)
+import warnings
+import csv
+import pickle
+import re
+from urllib.parse import urlparse
+from datetime import datetime
+import argparse
+warnings.filterwarnings('ignore')
 
-# 设置项目路径
-current_script_path = os.path.abspath(__file__)
-src_dir = os.path.dirname(current_script_path)
-project_root = os.path.dirname(src_dir)
-sys.path.append(project_root)
-from utils.load_data_url import *  # 包含load_webpages和load_reframing函数
+# -------------------------- 全局配置与常量 --------------------------
+URL_FEATURE_DIM = 8  # URL特征维度（与提取逻辑一致）
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[Global] Using device: {DEVICE}")
 
-warnings.filterwarnings("ignore")
+# 路径配置（可通过命令行参数覆盖）
+DEFAULT_DATA_DIR = "../data/web_articles"
+DEFAULT_ADV_DATA_DIR = "../data/adversarial_test"
+DEFAULT_MODEL_SAVE_PATH = "../models/sheepdog_url_chunks.pth"
+DEFAULT_METRICS_SAVE_PATH = "../results/evaluation_metrics.csv"
+DEFAULT_PRED_SAVE_DIR = "../results"
 
-# 命令行参数解析
-parser = argparse.ArgumentParser()
-parser.add_argument('--dataset_name', default='web', type=str)
-parser.add_argument('--model_name', default='SheepDog-Web', type=str)
-parser.add_argument('--iters', default=3, type=int)
-parser.add_argument('--batch_size', default=8, type=int)
-parser.add_argument('--n_epochs', default=15, type=int)
-args = parser.parse_args()
+# -------------------------- 1. 命令行参数解析 --------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Sheepdog URL + 长文本分段钓鱼检测模型（支持完整评估指标）")
+    
+    # 数据集参数
+    parser.add_argument("--dataset_name", type=str, default="web", help="数据集名称（如'politifact'，与pkl文件前缀一致）")
+    parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR, help="训练/测试集pkl文件目录")
+    parser.add_argument("--adv_data_dir", type=str, default=DEFAULT_ADV_DATA_DIR, help="对抗性测试集pkl文件目录")
+    
+    # 模型与训练参数
+    parser.add_argument("--max_len", type=int, default=512, help="文本分段最大长度（与模型max_len一致）")
+    parser.add_argument("--batch_size", type=int, default=2, help="批次大小（分段后建议≤2）")
+    parser.add_argument("--epochs", type=int, default=10, help="训练轮数")
+    parser.add_argument("--lr", type=float, default=2e-5, help="学习率")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="权重衰减（正则化）")
+    parser.add_argument("--aggregation", type=str, default="mean", choices=["mean", "max", "weighted"], help="分段聚合策略")
+    parser.add_argument("--val_split", type=float, default=0.1, help="从训练集拆分验证集的比例")
+    
+    # 保存路径参数
+    parser.add_argument("--model_save_path", type=str, default=DEFAULT_MODEL_SAVE_PATH, help="最优模型保存路径")
+    parser.add_argument("--metrics_save_path", type=str, default=DEFAULT_METRICS_SAVE_PATH, help="评估指标CSV保存路径")
+    parser.add_argument("--pred_save_dir", type=str, default=DEFAULT_PRED_SAVE_DIR, help="预测结果保存目录")
+    
+    # 其他参数
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader多进程数量")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子（保证可复现）")
+    
+    args = parser.parse_args()
+    return args
 
-# 设备设置
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# -------------------------- 2. 工具函数（数据分段、URL特征提取） --------------------------
+def set_seed(seed):
+    """设置随机种子，保证实验可复现"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    print(f"[Utils] Random seed set to {seed}")
 
-# 随机种子设置
-torch.manual_seed(0)
-np.random.seed(0)
-torch.backends.cudnn.deterministic = True
-torch.cuda.manual_seed_all(0)
+def split_long_text(text, max_len):
+    """将长文本分割为多个不超过max_len的片段"""
+    chunks = []
+    if not text:
+        return [""]
+    for i in range(0, len(text), max_len):
+        chunk = text[i:i+max_len].strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks if chunks else [""]
 
+def extract_url_features(url):
+    """提取URL的8维特征（标准化）"""
+    try:
+        parsed = urlparse(url)
+        features = []
+        
+        # 1. 协议类型（http=0, https=1, 其他=2）
+        scheme = parsed.scheme.lower()
+        features.append(1 if scheme == 'https' else 0 if scheme == 'http' else 2)
+        
+        # 2. 域名长度（标准化到0-1）
+        domain = parsed.netloc
+        features.append(min(len(domain), 200) / 200)
+        
+        # 3. 是否包含多子域名（不含www）
+        subdomain_count = len([p for p in domain.split('.') if p and p != 'www'])
+        features.append(1 if subdomain_count > 1 else 0)
+        
+        # 4. 路径长度（标准化到0-1）
+        path_len = len(parsed.path)
+        features.append(min(path_len, 200) / 200)
+        
+        # 5. 是否有查询参数
+        features.append(1 if parsed.query else 0)
+        
+        # 6. 是否有锚点
+        features.append(1 if parsed.fragment else 0)
+        
+        # 7. 域名数字占比
+        digit_ratio = len(re.findall(r'\d', domain)) / len(domain) if domain else 0.0
+        features.append(digit_ratio)
+        
+        # 8. 是否包含特殊字符
+        special_chars = r'@&=+%$#!?*()[]{}'
+        features.append(1 if any(c in special_chars for c in url) else 0)
+        
+        return np.array(features, dtype=np.float32)
+    except:
+        return np.array([2, 0, 0, 0, 0, 0, 0.0, 0], dtype=np.float32)
 
-# 辅助函数：判断字符串是否为URL格式
-def is_url_like(s):
-    """检测字符串是否包含URL特征"""
-    s = str(s).lower()
-    url_features = ['http://', 'https://', '.com', '.net', '.org', '.cn', '.co.uk', 'www.']
-    return any(feat in s for feat in url_features)
-
-
-# 训练数据集类（支持URL特征）
-class WebDatasetAug(Dataset):
-    def __init__(self, texts, urls, aug_texts1, aug_texts2, labels, fg_label, aug_fg1, aug_fg2, tokenizer, max_len):
-        # 1. 数据长度严格验证
-        lengths = [
-            len(texts), len(urls), len(aug_texts1),
-            len(aug_texts2), len(labels), len(fg_label),
-            len(aug_fg1), len(aug_fg2)
-        ]
-        if len(set(lengths)) != 1:
-            raise ValueError(f"所有输入数据长度必须一致！长度分别为: {lengths}")
-
-        # 2. 内容混淆检测
-        self._detect_content_mixup(texts, urls)
-
-        # 3. 调整数据长度（如有必要）
-        texts = self._adjust_length(texts, lengths[0])
-        urls = self._adjust_length(urls, lengths[0])
-        aug_texts1 = self._adjust_length(aug_texts1, lengths[0])
-        aug_texts2 = self._adjust_length(aug_texts2, lengths[0])
-
-        # 4. 数据转换与清洗
-        self.texts = [str(text) for text in texts]
-        self.urls = [str(url) for url in urls]
-        self.aug_texts1 = [str(text) for text in aug_texts1]
-        self.aug_texts2 = [str(text) for text in aug_texts2]
-
-        # 5. 标签处理与验证
-        self.labels = self.clean_labels(labels)
-        self.fg_label = self.clean_finegrained_labels(fg_label)
-        self.aug_fg1 = self.clean_finegrained_labels(aug_fg1)
-        self.aug_fg2 = self.clean_finegrained_labels(aug_fg2)
-
+# -------------------------- 3. 数据加载相关（Dataset + DataLoader） --------------------------
+class WebDatasetWithChunks(Dataset):
+    """适配分段文本的Dataset类（保存urls便于后续预测结果保存）"""
+    def __init__(self, texts_chunks, urls, labels, tokenizer, max_len):
+        self.texts_chunks = texts_chunks  # 格式：[[chunk1, chunk2], ...]
+        self.urls = urls  # 保存URL，用于预测结果输出
+        self.labels = labels
         self.tokenizer = tokenizer
         self.max_len = max_len
 
-    def _detect_content_mixup(self, texts, urls):
-        """检测texts和urls是否发生内容混淆"""
-        if len(texts) == 0 or len(urls) == 0:
-            return
+    def __len__(self):
+        return len(self.texts_chunks)
 
-        # 检查前3个样本的内容特征
-        text_is_url_count = sum([is_url_like(str(texts[i])) for i in range(min(3, len(texts)))])
-        url_is_text_count = sum([not is_url_like(str(urls[i])) for i in range(min(3, len(urls)))])
+    def __getitem__(self, idx):
+        chunks = self.texts_chunks[idx]
+        url = self.urls[idx]
+        label = self.labels[idx]
 
-        # 如果发现明显混淆，抛出错误
-        if text_is_url_count > 1 and url_is_text_count > 1:
-            sample_texts = [str(texts[i])[:50] for i in range(min(3, len(texts)))]
-            sample_urls = [str(urls[i])[:50] for i in range(min(3, len(urls)))]
-            raise ValueError(
-                f"疑似texts和urls内容混淆！\n"
-                f"前3个文本样本（应不含URL）: {sample_texts}\n"
-                f"前3个URL样本（应含URL）: {sample_urls}"
+        # 对每个片段编码
+        chunk_encodings = []
+        for chunk in chunks:
+            encoding = self.tokenizer.encode_plus(
+                chunk,
+                add_special_tokens=True,
+                max_length=self.max_len,
+                padding='max_length',
+                truncation=True,
+                return_attention_mask=True,
+                return_tensors='pt'
             )
-
-    @staticmethod
-    def _adjust_length(data, target_length):
-        """统一调整列表长度以匹配目标长度"""
-        if len(data) == target_length:
-            return data
-
-        if len(data) > target_length:
-            return data[:target_length]
-        else:
-            # 根据数据类型选择填充值
-            if isinstance(data[0], (str, np.str_)):
-                fill_value = ''
-            elif isinstance(data[0], (int, float, np.number)):
-                fill_value = 0
-            else:
-                fill_value = data[0]  # 使用第一个元素的类型填充
-            return data + [fill_value] * (target_length - len(data))
-
-    def clean_labels(self, labels):
-        """清洗分类标签，确保为整数类型"""
-        cleaned = []
-        for label in labels:
-            try:
-                if isinstance(label, str):
-                    label = label.strip().replace('"', '').replace("'", "")
-                cleaned.append(int(float(label)))
-            except (ValueError, TypeError):
-                cleaned.append(0)
-        return np.array(cleaned, dtype=int)
-
-    def clean_finegrained_labels(self, labels):
-        cleaned = []
-        for label in labels:
-            try:
-                if isinstance(label, str):
-                    import re
-                    nums = re.findall(r'\d+\.\d+|\d+', label.strip())
-                    arr = np.array(nums, dtype=float)[:4]
-                elif isinstance(label, (list, np.ndarray)):
-                    arr = np.array(label, dtype=float)[:4]
-                else:
-                    arr = np.full(4, float(label), dtype=float)
-                
-                # 强制补全为4维
-                if len(arr) < 4:
-                    arr = np.pad(arr, (0, 4 - len(arr)), mode='constant')
-                # 限制取值在[0,1]
-                arr = np.clip(arr, 0.0, 1.0)
-                cleaned.append(arr)
-            except:
-                cleaned.append(np.zeros(4, dtype=float))  # 异常样本直接填充0
-        return np.array(cleaned, dtype=float)
-
-    def __getitem__(self, item):
-        text = self.texts[item]
-        url = self.urls[item]
-        url_features = self.extract_url_features(url)
-        aug_text1 = self.aug_texts1[item]
-        aug_text2 = self.aug_texts2[item]
-        label = self.labels[item]
-        fg_label = self.fg_label[item]
-        aug_fg1 = self.aug_fg1[item]
-        aug_fg2 = self.aug_fg2[item]
-
-        # 文本编码
-        encoding = self.tokenizer.encode_plus(
-            text, add_special_tokens=True, max_length=self.max_len,
-            padding='max_length', truncation=True, return_token_type_ids=False,
-            return_attention_mask=True, return_tensors='pt'
-        )
-        aug1_encoding = self.tokenizer.encode_plus(
-            aug_text1, add_special_tokens=True, max_length=self.max_len,
-            padding='max_length', truncation=True, return_token_type_ids=False,
-            return_attention_mask=True, return_tensors='pt'
-        )
-        aug2_encoding = self.tokenizer.encode_plus(
-            aug_text2, add_special_tokens=True, max_length=self.max_len,
-            padding='max_length', truncation=True, return_token_type_ids=False,
-            return_attention_mask=True, return_tensors='pt'
-        )
+            chunk_encodings.append({
+                'input_ids': encoding['input_ids'].flatten(),
+                'attention_mask': encoding['attention_mask'].flatten()
+            })
 
         return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'input_ids_aug1': aug1_encoding['input_ids'].flatten(),
-            'input_ids_aug2': aug2_encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'attention_mask_aug1': aug1_encoding['attention_mask'].flatten(),
-            'attention_mask_aug2': aug2_encoding['attention_mask'].flatten(),
+            'chunks': chunk_encodings,
+            'url_features': torch.tensor(extract_url_features(url), dtype=torch.float32),
             'labels': torch.tensor(label, dtype=torch.long),
-            'fg_label': torch.FloatTensor(fg_label),  # 二维标签
-            'fg_label_aug1': torch.FloatTensor(aug_fg1),
-            'fg_label_aug2': torch.FloatTensor(aug_fg2),
-            'url_features': torch.FloatTensor(url_features)
+            'url': url  # 单个URL，用于后续保存
         }
 
-    def extract_url_features(self, url):
-        """提取URL的5维特征"""
-        import tldextract
-        ext = tldextract.extract(url)
-        domain = ext.domain + '.' + ext.suffix if ext.suffix else ext.domain
-        return [
-            len(url),  # URL长度
-            len(domain),  # 域名长度
-            1 if 'http://' in url else 0,  # 是否使用HTTP（非HTTPS）
-            1 if '@' in url else 0,  # 是否含@符号
-            1 if '//' in url.split('://')[1:] else 0  # 是否含多重//
-        ]
+def collate_chunks(batch):
+    """自定义Collate函数：处理片段数量不一致问题"""
+    chunks_list = [item['chunks'] for item in batch]
+    url_features = torch.stack([item['url_features'] for item in batch])
+    labels = torch.tensor([item['labels'] for item in batch], dtype=torch.long)
+    urls = [item['url'] for item in batch]  # 收集当前批次的URL
+    
+    return {
+        'chunks': chunks_list,
+        'url_features': url_features,
+        'labels': labels,
+        'urls': urls  # 返回URL列表
+    }
 
-    def __len__(self):
-        return len(self.texts)
+def load_pkl_data(file_path):
+    """加载pkl文件，验证关键字段"""
+    try:
+        with open(file_path, 'rb') as f:
+            data_dict = pickle.load(f)
+    except Exception as e:
+        raise RuntimeError(f"加载pkl文件失败：{file_path} -> {str(e)}")
+    
+    required_keys = ['html', 'url', 'labels']
+    missing_keys = [k for k in required_keys if k not in data_dict]
+    if missing_keys:
+        raise KeyError(f"pkl文件缺少关键字段：{missing_keys}（文件：{file_path}）")
+    
+    return data_dict
 
+def create_dataloaders(args, tokenizer):
+    """加载数据并创建训练/验证/测试/对抗性测试集DataLoader"""
+    print(f"\n[DataLoader] 开始加载数据（数据集：{args.dataset_name}）")
+    
+    # 1. 定义文件路径
+    train_pkl = os.path.join(args.data_dir, f"{args.dataset_name}_train.pkl")
+    test_pkl = os.path.join(args.data_dir, f"{args.dataset_name}_test.pkl")
+    adv_pkl = os.path.join(args.adv_data_dir, f"{args.dataset_name}_test_adv_A.pkl")
+    
+    # 2. 加载pkl数据
+    train_dict = load_pkl_data(train_pkl)
+    test_dict = load_pkl_data(test_pkl)
+    adv_dict = load_pkl_data(adv_pkl)
+    
+    # 3. 文本分段（核心步骤）
+    print(f"[DataLoader] 对长文本进行分段（max_len={args.max_len}）")
+    x_train = [split_long_text(text, args.max_len) for text in train_dict['html']]
+    x_test = [split_long_text(text, args.max_len) for text in test_dict['html']]
+    x_adv_test = [split_long_text(text, args.max_len) for text in adv_dict['html']]
+    
+    # 4. 提取其他字段
+    y_train, url_train = train_dict['labels'], train_dict['url']
+    y_test, url_test = test_dict['labels'], test_dict['url']
+    y_adv_test, url_adv_test = adv_dict['labels'], adv_dict['url']
+    
+    # 5. 拆分验证集（从训练集取val_split比例）
+    val_size = int(len(x_train) * args.val_split)
+    x_val, y_val, url_val = x_train[:val_size], y_train[:val_size], url_train[:val_size]
+    x_train, y_train, url_train = x_train[val_size:], y_train[val_size:], url_train[val_size:]
+    
+    # 6. 打印数据统计
+    def print_stats(name, texts_chunks, labels):
+        total = len(texts_chunks)
+        chunks_total = sum(len(c) for c in texts_chunks)
+        pos = sum(1 for l in labels if l == 1)
+        print(f"  {name:15s}: 样本数={total:4d} | 正类={pos:4d} | 负类={total-pos:4d} | 总片段数={chunks_total:5d} | 平均片段数={chunks_total/total:.2f}")
+    
+    print("\n[DataLoader] 数据统计：")
+    print_stats("训练集", x_train, y_train)
+    print_stats("验证集", x_val, y_val)
+    print_stats("测试集", x_test, y_test)
+    print_stats("对抗性测试集", x_adv_test, y_adv_test)
+    
+    # 7. 创建DataLoader
+    print(f"\n[DataLoader] 创建DataLoader（batch_size={args.batch_size}）")
+    train_loader = DataLoader(
+        WebDatasetWithChunks(x_train, url_train, y_train, tokenizer, args.max_len),
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_chunks,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        WebDatasetWithChunks(x_val, url_val, y_val, tokenizer, args.max_len),
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_chunks,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        WebDatasetWithChunks(x_test, url_test, y_test, tokenizer, args.max_len),
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_chunks,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    adv_test_loader = DataLoader(
+        WebDatasetWithChunks(x_adv_test, url_adv_test, y_adv_test, tokenizer, args.max_len),
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_chunks,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    
+    print(f"[DataLoader] DataLoader创建完成：")
+    print(f"  训练集批次：{len(train_loader)} | 验证集批次：{len(val_loader)} | 测试集批次：{len(test_loader)} | 对抗性测试集批次：{len(adv_test_loader)}")
+    
+    return train_loader, val_loader, test_loader, adv_test_loader
 
-# 测试数据集类
-class WebDataset(Dataset):
-    def __init__(self, texts, urls, labels, tokenizer, max_len):
-        # 1. 数据长度严格验证
-        lengths = [len(texts), len(urls), len(labels)]
-        if len(set(lengths)) != 1:
-            raise ValueError(f"所有输入数据长度必须一致！长度分别为: {lengths}")
-
-        # 2. 内容混淆检测
-        self._detect_content_mixup(texts, urls)
-
-        # 3. 调整数据长度（如有必要）
-        texts = self._adjust_length(texts, lengths[0])
-        urls = self._adjust_length(urls, lengths[0])
-
-        # 4. 数据转换与清洗
-        self.texts = [str(text) for text in texts]
-        self.urls = [str(url) for url in urls]
-
-        # 5. 清洗并验证标签
-        self.labels = self.clean_labels(labels)
-
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-
-    def _detect_content_mixup(self, texts, urls):
-        """检测texts和urls是否发生内容混淆"""
-        if len(texts) == 0 or len(urls) == 0:
-            return
-
-        # 检查前3个样本的内容特征
-        text_is_url_count = sum([is_url_like(str(texts[i])) for i in range(min(3, len(texts)))])
-        url_is_text_count = sum([not is_url_like(str(urls[i])) for i in range(min(3, len(urls)))])
-
-        # 如果发现明显混淆，抛出错误
-        if text_is_url_count > 1 and url_is_text_count > 1:
-            sample_texts = [str(texts[i])[:50] for i in range(min(3, len(texts)))]
-            sample_urls = [str(urls[i])[:50] for i in range(min(3, len(urls)))]
-            raise ValueError(
-                f"疑似texts和urls内容混淆！\n"
-                f"前3个文本样本（应不含URL）: {sample_texts}\n"
-                f"前3个URL样本（应含URL）: {sample_urls}"
-            )
-
-    @staticmethod
-    def _adjust_length(data, target_length):
-        """统一调整列表长度以匹配目标长度"""
-        if len(data) == target_length:
-            return data
-
-        if len(data) > target_length:
-            return data[:target_length]
-        else:
-            # 根据数据类型选择填充值
-            if isinstance(data[0], (str, np.str_)):
-                fill_value = ''
-            elif isinstance(data[0], (int, float, np.number)):
-                fill_value = 0
-            else:
-                fill_value = data[0]  # 使用第一个元素的类型填充
-            return data + [fill_value] * (target_length - len(data))
-
-    def clean_labels(self, labels):
-        """清洗标签，确保为整数类型"""
-        cleaned = []
-        for label in labels:
-            try:
-                if isinstance(label, str):
-                    # 特别检查是否为URL
-                    if 'http' in label or '.' in label:
-                        raise ValueError(f"标签中包含URL: {label}")
-                    label = label.strip().replace('"', '').replace("'", "")
-                cleaned.append(int(float(label)))
-            except (ValueError, TypeError) as e:
-                cleaned.append(0)
-        return np.array(cleaned, dtype=int)
-
-    def __getitem__(self, item):
-        text = self.texts[item]
-        url = self.urls[item]
-        url_features = self.extract_url_features(url)
-        label = self.labels[item]
-
-        encoding = self.tokenizer.encode_plus(
-            text, add_special_tokens=True, max_length=self.max_len,
-            padding='max_length', truncation=True, return_token_type_ids=False,
-            return_attention_mask=True, return_tensors='pt'
-        )
-
-        return {
-            'news_text': text,
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'labels': torch.tensor(label, dtype=torch.long),
-            'url_features': torch.FloatTensor(url_features)
-        }
-
-    def extract_url_features(self, url):
-        """与训练集共享相同的URL特征提取逻辑"""
-        import tldextract
-        ext = tldextract.extract(url)
-        domain = ext.domain + '.' + ext.suffix if ext.suffix else ext.domain
-        return [
-            len(url), len(domain),
-            1 if 'http://' in url else 0,
-            1 if '@' in url else 0,
-            1 if '//' in url.split('://')[1:] else 0
-        ]
-
-    def __len__(self):
-        return len(self.texts)
-
-
-# 融合URL特征的RoBERTa模型
+# -------------------------- 4. 模型定义（分段聚合+URL特征融合） --------------------------
 class RobertaWebClassifier(nn.Module):
-    def __init__(self, n_classes, url_feat_dim=5):
+    def __init__(self, aggregation_strategy='mean'):
         super(RobertaWebClassifier, self).__init__()
         self.roberta = RobertaModel.from_pretrained('roberta-base')
-        self.dropout = nn.Dropout(p=0.5)
+        self.dropout = nn.Dropout(p=0.3)
+        self.classifier = nn.Linear(
+            self.roberta.config.hidden_size + URL_FEATURE_DIM,
+            2  # 二分类：合法/钓鱼
+        )
+        self.sigmoid = nn.Sigmoid()
+        assert aggregation_strategy in ['mean', 'max', 'weighted'], "无效的聚合策略"
+        self.aggregation_strategy = aggregation_strategy
 
-        # 文本特征处理
-        self.text_fc = nn.Linear(self.roberta.config.hidden_size, 128)
+    def forward(self, chunks, url_features):
+        batch_size = len(chunks)
+        batch_aggregated = []
+        
+        for i in range(batch_size):
+            sample_chunks = chunks[i]
+            chunk_features = []
+            
+            # 提取每个片段的CLS特征
+            for chunk in sample_chunks:
+                input_ids = chunk['input_ids'].unsqueeze(0).to(DEVICE)
+                attention_mask = chunk['attention_mask'].unsqueeze(0).to(DEVICE)
+                
+                roberta_out = self.roberta(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True
+                )
+                cls_feat = roberta_out.last_hidden_state[:, 0, :]  # (1, hidden_size)
+                chunk_features.append(cls_feat)
+            
+            # 片段聚合
+            chunk_feat_tensor = torch.cat(chunk_features, dim=0)
+            if self.aggregation_strategy == 'mean':
+                agg_feat = torch.mean(chunk_feat_tensor, dim=0, keepdim=True)
+            elif self.aggregation_strategy == 'max':
+                agg_feat = torch.max(chunk_feat_tensor, dim=0, keepdim=True)[0]
+            elif self.aggregation_strategy == 'weighted':
+                chunk_lengths = [torch.sum(c['attention_mask']).item() for c in sample_chunks]
+                weights = torch.tensor(chunk_lengths, dtype=torch.float32).to(DEVICE)
+                weights = weights / torch.sum(weights)
+                agg_feat = torch.matmul(weights.unsqueeze(0), chunk_feat_tensor)
+            
+            batch_aggregated.append(agg_feat)
+        
+        # 融合URL特征并分类
+        batch_aggregated = torch.cat(batch_aggregated, dim=0).to(DEVICE)
+        url_features = url_features.to(DEVICE)
+        combined = torch.cat([batch_aggregated, url_features], dim=1)
+        x = self.dropout(combined)
+        logits = self.classifier(x)
+        probs = self.sigmoid(logits)
+        
+        return logits, probs
 
-        # URL特征处理
-        self.url_fc = nn.Linear(url_feat_dim, 32)
-
-        # 融合特征分类
-        self.fc_out = nn.Linear(128 + 32, n_classes)  # 融合文本和URL特征
-        self.binary_transform = nn.Linear(128 + 32, 2)  # 二分类输出层
-
-    def forward(self, input_ids, attention_mask, url_features):
-        # 文本特征提取
-        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs[1]
-        text_feat = self.dropout(pooled_output)
-        text_feat = self.text_fc(text_feat)
-
-        # URL特征提取
-        url_feat = self.url_fc(url_features)
-
-        # 特征融合
-        combined_feat = torch.cat([text_feat, url_feat], dim=1)
-
-        # 输出层
-        output = self.fc_out(combined_feat)
-        binary_output = self.binary_transform(combined_feat)
-
-        return output, binary_output
-
-
-# 创建训练数据加载器
-def create_train_loader(contents, urls, contents_aug1, contents_aug2, labels, fg_label, aug_fg1, aug_fg2,
-                        tokenizer, max_len, batch_size):
-    # 验证数据长度并打印调试信息
-    print(f"创建训练加载器 - 文本: {len(contents)}, URL: {len(urls)}, 标签: {len(labels)}")
-    ds = WebDatasetAug(
-        texts=contents, urls=urls,
-        aug_texts1=contents_aug1, aug_texts2=contents_aug2,
-        labels=labels, fg_label=fg_label,
-        aug_fg1=aug_fg1, aug_fg2=aug_fg2,
-        tokenizer=tokenizer, max_len=max_len
-    )
-    return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=5)
-
-
-# 创建评估数据加载器
-def create_eval_loader(contents, urls, labels, tokenizer, max_len, batch_size):
-    # 验证数据长度并打印调试信息
-    print(f"创建评估加载器 - 文本: {len(contents)}, URL: {len(urls)}, 标签: {len(labels)}")
-    ds = WebDataset(
-        texts=contents, urls=urls,
-        labels=labels,
-        tokenizer=tokenizer, max_len=max_len
-    )
-    return DataLoader(ds, batch_size=batch_size, num_workers=0)
-
-
-# 随机种子设置
-def set_seed(seed):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.cuda.manual_seed_all(seed)
-
-
-def calculate_tpr_at_fpr(y_true, y_score, target_fpr):
-    """计算特定FPR下的TPR"""
-    # 计算FPR和TPR
+# -------------------------- 5. 评估指标计算（完整16个指标） --------------------------
+def calculate_tpr_at_fpr(y_true, y_score, target_fprs):
+    """计算指定FPR下的TPR（线性插值）"""
+    from sklearn.metrics import roc_curve
     fpr, tpr, _ = roc_curve(y_true, y_score)
-    # 处理FPR单调递增特性，找到第一个>=target_fpr的点
-    idx = np.where(fpr >= target_fpr)[0]
-    if len(idx) == 0:  # 所有FPR均小于目标值，取最大TPR
-        return tpr[-1]
-    return tpr[idx[0]]
-
-
-# 保存评估结果到CSV
-def save_metrics_to_csv(metrics, datasetname, model_name, iterations):
-    """将评估指标保存到CSV文件"""
-    os.makedirs('../results', exist_ok=True)
-    csv_path = f'../results/metrics_{datasetname}_{model_name}.iter{iterations}.csv'
+    tpr_results = {}
     
-    # 计算平均值
-    avg_metrics = {key: sum(values)/len(values) if values else 0.0 for key, values in metrics.items() 
-                  if key not in ['datetime', 'elapsed_time']}
+    for target_fpr in target_fprs:
+        idx = np.searchsorted(fpr, target_fpr, side='left')
+        if idx == 0:
+            tpr_val = tpr[0] if len(tpr) > 0 else 0.0
+        elif idx >= len(fpr):
+            tpr_val = tpr[-1] if len(tpr) > 0 else 0.0
+        else:
+            if fpr[idx] == target_fpr:
+                tpr_val = tpr[idx]
+            else:
+                # 线性插值
+                tpr_val = tpr[idx-1] + (target_fpr - fpr[idx-1]) * (tpr[idx] - tpr[idx-1]) / (fpr[idx] - fpr[idx-1])
+        tpr_results[f'TPR@FPR={target_fpr}'] = tpr_val
     
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        
-        # 写入表头
-        writer.writerow(['指标', '平均值', '各次迭代结果'])
-        
-        # 写入原始测试集指标
-        writer.writerow(['', '', ''])
-        writer.writerow(['原始测试集指标', '', ''])
-        writer.writerow(['准确率 (ACC)', f'{avg_metrics["acc"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['acc'])])
-        writer.writerow(['精确率 (Precision)', f'{avg_metrics["prec"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['prec'])])
-        writer.writerow(['召回率 (Recall)', f'{avg_metrics["recall"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['recall'])])
-        writer.writerow(['F1分数', f'{avg_metrics["f1"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['f1'])])
-        writer.writerow(['加权召回率', f'{avg_metrics["weighted_recall"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['weighted_recall'])])
-        writer.writerow(['MCC', f'{avg_metrics["mcc"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['mcc'])])
-        writer.writerow(['ROC-AUC', f'{avg_metrics["roc_auc"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['roc_auc'])])
-        writer.writerow(['PR-AUC', f'{avg_metrics["pr_auc"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['pr_auc'])])
-        writer.writerow(['TPR@FPR=0.0001', f'{avg_metrics["tpr_fpr_0001"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_0001'])])
-        writer.writerow(['TPR@FPR=0.001', f'{avg_metrics["tpr_fpr_001"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_001'])])
-        writer.writerow(['TPR@FPR=0.01', f'{avg_metrics["tpr_fpr_01"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_01'])])
-        writer.writerow(['TPR@FPR=0.1', f'{avg_metrics["tpr_fpr_1"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_1'])])
-        
-        # 写入对抗测试集指标
-        writer.writerow(['', '', ''])
-        writer.writerow(['对抗测试集指标', '', ''])
-        writer.writerow(['准确率 (ACC)', f'{avg_metrics["acc_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['acc_res'])])
-        writer.writerow(['精确率 (Precision)', f'{avg_metrics["prec_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['prec_res'])])
-        writer.writerow(['召回率 (Recall)', f'{avg_metrics["recall_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['recall_res'])])
-        writer.writerow(['F1分数', f'{avg_metrics["f1_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['f1_res'])])
-        writer.writerow(['加权召回率', f'{avg_metrics["weighted_recall_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['weighted_recall_res'])])
-        writer.writerow(['MCC', f'{avg_metrics["mcc_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['mcc_res'])])
-        writer.writerow(['ROC-AUC', f'{avg_metrics["roc_auc_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['roc_auc_res'])])
-        writer.writerow(['PR-AUC', f'{avg_metrics["pr_auc_res"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['pr_auc_res'])])
-        writer.writerow(['TPR@FPR=0.0001', f'{avg_metrics["tpr_fpr_res_0001"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_res_0001'])])
-        writer.writerow(['TPR@FPR=0.001', f'{avg_metrics["tpr_fpr_res_001"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_res_001'])])
-        writer.writerow(['TPR@FPR=0.01', f'{avg_metrics["tpr_fpr_res_01"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_res_01'])])
-        writer.writerow(['TPR@FPR=0.1', f'{avg_metrics["tpr_fpr_res_1"]:.4f}', ', '.join(f'{x:.4f}' for x in metrics['tpr_fpr_res_1'])])
-        
-        # 写入时间信息
-        writer.writerow(['', '', ''])
-        writer.writerow(['时间信息', '', ''])
-        for i in range(iterations):
-            writer.writerow([f'迭代 {i}', metrics['datetime'][i], metrics['elapsed_time'][i]])
+    return tpr_results
+
+def compute_all_metrics(y_true, y_pred, y_score):
+    """计算所有16个评估指标"""
+    # 1. 混淆矩阵
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
     
-    print(f"评估结果已保存到CSV文件: {csv_path}")
-
-
-# 训练模型
-def train_model(tokenizer, max_len, n_epochs, batch_size, datasetname, iter):
-    # 记录开始时间
-    start_time = time.time()
-
-    # 加载网页数据集并显式解析返回值
-    data = load_webpages(datasetname)
+    # 2. 基础指标
+    acc = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    weighted_f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    
+    # 3. AUC指标
     try:
-        # 按照load_webpages的实际返回顺序解析
-        train_texts = data[0]
-        test_texts = data[1]
-        test_texts_res = data[2]  # 对抗性测试集文本
-        train_labels = data[3]
-        test_labels = data[4]
-        train_urls = data[5]
-        test_urls = data[6]
-    except IndexError:
-        raise ValueError("load_webpages返回格式错误，需包含[x_train, x_test, x_test_res, y_train, y_test, url_train, url_test]")
-
-    # 修复对抗性测试集长度不匹配问题
-    if len(test_texts_res) != len(test_urls) or len(test_texts_res) != len(test_labels):
-        min_len = min(len(test_texts_res), len(test_urls), len(test_labels))
-        print(f"警告：对抗性测试集文本({len(test_texts_res)})、URL({len(test_urls)})、标签({len(test_labels)})长度不匹配，将统一截断到{min_len}")
-        test_texts_res = test_texts_res[:min_len]
-        test_urls_adj = test_urls[:min_len]  # 为对抗测试集创建调整后的URL副本
-        test_labels_adj = test_labels[:min_len]  # 为对抗测试集创建调整后的标签副本
-    else:
-        test_urls_adj = test_urls
-        test_labels_adj = test_labels
-
-    # 确保训练集长度一致
-    if len(train_texts) != len(train_urls) or len(train_texts) != len(train_labels):
-        min_train_len = min(len(train_texts), len(train_urls), len(train_labels))
-        print(f"警告：训练集文本({len(train_texts)})、URL({len(train_urls)})、标签({len(train_labels)})长度不匹配，统一截断到{min_train_len}")
-        train_texts = train_texts[:min_train_len]
-        train_urls = train_urls[:min_train_len]
-        train_labels = train_labels[:min_train_len]
-
-    # 确保标准测试集长度一致
-    if len(test_texts) != len(test_urls) or len(test_texts) != len(test_labels):
-        min_test_len = min(len(test_texts), len(test_urls), len(test_labels))
-        print(f"警告：标准测试集文本({len(test_texts)})、URL({len(test_urls)})、标签({len(test_labels)})长度不匹配，统一截断到{min_test_len}")
-        test_texts = test_texts[:min_test_len]
-        test_urls = test_urls[:min_test_len]
-        test_labels = test_labels[:min_test_len]
-
-    # 验证所有数据集长度
-    print(f"训练集 - 文本: {len(train_texts)}, URL: {len(train_urls)}, 标签: {len(train_labels)}")
-    print(f"标准测试集 - 文本: {len(test_texts)}, URL: {len(test_urls)}, 标签: {len(test_labels)}")
-    print(f"对抗测试集 - 文本: {len(test_texts_res)}, URL: {len(test_urls_adj)}, 标签: {len(test_labels_adj)}")
-
-    # 验证标签有效性
-    def is_valid_label(label):
-        if isinstance(label, (int, float, np.number)):
-            return True
-        if isinstance(label, str):
-            return label.isdigit() and 'http' not in label and '.' not in label
-        return False
-
-    # 清理训练标签
-    invalid_train = [i for i, lab in enumerate(train_labels) if not is_valid_label(lab)]
-    if invalid_train:
-        print(f"警告：训练集中发现{len(invalid_train)}个无效标签，已替换为0")
-        for i in invalid_train:
-            train_labels[i] = 0
-
-    # 清理测试标签
-    invalid_test = [i for i, lab in enumerate(test_labels) if not is_valid_label(lab)]
-    if invalid_test:
-        print(f"警告：测试集中发现{len(invalid_test)}个无效标签，已替换为0")
-        for i in invalid_test:
-            test_labels[i] = 0
-
-    # 创建测试数据加载器
-    test_loader = create_eval_loader(
-        test_texts, test_urls, test_labels,
-        tokenizer, max_len, batch_size
-    )
+        roc_auc = roc_auc_score(y_true, y_score)
+    except ValueError:
+        roc_auc = 0.0
+    prec_curve, rec_curve, _ = precision_recall_curve(y_true, y_score)
+    pr_auc = auc(rec_curve, prec_curve)
     
-    # 创建对抗测试数据加载器
-    test_loader_res = create_eval_loader(
-        test_texts_res, test_urls_adj, test_labels_adj,
-        tokenizer, max_len, batch_size
-    )
-
-    # 创建训练数据增强版本（简单复制作为示例，实际应用中应使用真实增强数据）
-    train_texts_aug1 = [text + " [增强1]" for text in train_texts]
-    train_texts_aug2 = [text + " [增强2]" for text in train_texts]
-    fg_label = np.random.rand(len(train_texts), 4)  # 示例细粒度标签
-    aug_fg1 = fg_label.copy()
-    aug_fg2 = fg_label.copy()
-
-    # 创建训练数据加载器
-    train_loader = create_train_loader(
-        train_texts, train_urls, train_texts_aug1, train_texts_aug2,
-        train_labels, fg_label, aug_fg1, aug_fg2,
-        tokenizer, max_len, batch_size
-    )
-
-    # 确定类别数量
-    unique_labels = np.unique(train_labels)
-    n_classes = len(unique_labels)
-    print(f"检测到的类别: {unique_labels}, 类别数量: {n_classes}")
-
-    # 初始化模型
-    model = RobertaWebClassifier(n_classes)
-    model = model.to(device)
-
-    # 定义损失函数和优化器
-    criterion = nn.CrossEntropyLoss().to(device)
-    optimizer = AdamW(model.parameters(), lr=2e-5)
-
-    # 学习率调度器
-    total_steps = len(train_loader) * n_epochs
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=0, num_training_steps=total_steps
-    )
-
-    # 训练循环
-    best_accuracy = 0
-    for epoch in range(n_epochs):
-        model.train()
-        train_loss = 0
-        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{n_epochs}', leave=False)
-        
-        for batch in progress_bar:
-            input_ids = batch['input_ids'].to(device)
-            input_ids_aug1 = batch['input_ids_aug1'].to(device)
-            input_ids_aug2 = batch['input_ids_aug2'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            attention_mask_aug1 = batch['attention_mask_aug1'].to(device)
-            attention_mask_aug2 = batch['attention_mask_aug2'].to(device)
-            labels = batch['labels'].to(device)
-            fg_label = batch['fg_label'].to(device)
-            fg_label_aug1 = batch['fg_label_aug1'].to(device)
-            fg_label_aug2 = batch['fg_label_aug2'].to(device)
-            url_features = batch['url_features'].to(device)
-
-            # 清零梯度
-            optimizer.zero_grad()
-
-            # 前向传播（原始样本）
-            outputs, binary_outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                url_features=url_features
-            )
-            
-            # 前向传播（增强样本1）
-            outputs_aug1, _ = model(
-                input_ids=input_ids_aug1,
-                attention_mask=attention_mask_aug1,
-                url_features=url_features
-            )
-            
-            # 前向传播（增强样本2）
-            outputs_aug2, _ = model(
-                input_ids=input_ids_aug2,
-                attention_mask=attention_mask_aug2,
-                url_features=url_features
-            )
-
-            # 计算损失
-            loss_ce = criterion(outputs, labels)
-            loss_ce_aug1 = criterion(outputs_aug1, labels)
-            loss_ce_aug2 = criterion(outputs_aug2, labels)
-            
-            # 细粒度损失
-            loss_fg = F.mse_loss(torch.sigmoid(binary_outputs[:, 1]), fg_label[:, 0])
-            loss_fg_aug1 = F.mse_loss(torch.sigmoid(outputs_aug1[:, 1]), fg_label_aug1[:, 0])
-            loss_fg_aug2 = F.mse_loss(torch.sigmoid(outputs_aug2[:, 1]), fg_label_aug2[:, 0])
-
-            # 总损失
-            loss = (loss_ce + loss_ce_aug1 + loss_ce_aug2) + 0.1 * (loss_fg + loss_fg_aug1 + loss_fg_aug2)
-            
-            # 反向传播和优化
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            train_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item())
-
-        # 计算平均训练损失
-        avg_train_loss = train_loss / len(train_loader)
-        print(f'Epoch {epoch + 1}/{n_epochs}, 训练损失: {avg_train_loss:.4f}')
-
-        # 在测试集上评估
-        model.eval()
-        test_loss = 0
-        predictions = []
-        true_labels = []
-        probabilities = []
-
-        with torch.no_grad():
-            for batch in test_loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                url_features = batch['url_features'].to(device)
-
-                outputs, binary_outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    url_features=url_features
-                )
-
-                loss = criterion(outputs, labels)
-                test_loss += loss.item()
-
-                _, preds = torch.max(outputs, dim=1)
-                predictions.extend(preds.cpu().numpy())
-                true_labels.extend(labels.cpu().numpy())
-                probabilities.extend(F.softmax(outputs, dim=1)[:, 1].cpu().numpy())
-
-        avg_test_loss = test_loss / len(test_loader)
-        accuracy = accuracy_score(true_labels, predictions)
-        print(f'Epoch {epoch + 1}/{n_epochs}, 测试损失: {avg_test_loss:.4f}, 准确率: {accuracy:.4f}')
-
-        # 保存最佳模型
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            torch.save(model.state_dict(), f'best_model_{datasetname}_iter{iter}.bin')
-
-    # 计算最终评估指标
-    def evaluate(loader):
-        model.eval()
-        predictions = []
-        true_labels = []
-        probabilities = []
-        
-        with torch.no_grad():
-            for batch in loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
-                url_features = batch['url_features'].to(device)
-
-                outputs, _ = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    url_features=url_features
-                )
-
-                _, preds = torch.max(outputs, dim=1)
-                predictions.extend(preds.cpu().numpy())
-                true_labels.extend(labels.cpu().numpy())
-                probabilities.extend(F.softmax(outputs, dim=1)[:, 1].cpu().numpy())
-        
-        # 计算评估指标
-        accuracy = accuracy_score(true_labels, predictions)
-        precision, recall, f1, _ = score(true_labels, predictions, average='binary')
-        weighted_recall = recall_score(true_labels, predictions, average='weighted')
-        mcc = matthews_corrcoef(true_labels, predictions)
-        
-        # 计算ROC-AUC和PR-AUC
-        try:
-            roc_auc = roc_auc_score(true_labels, probabilities)
-        except ValueError:
-            roc_auc = 0.0
-            
-        pr_auc = average_precision_score(true_labels, probabilities)
-        
-        # 计算特定FPR下的TPR
-        tpr_fpr_0001 = calculate_tpr_at_fpr(true_labels, probabilities, 0.0001)
-        tpr_fpr_001 = calculate_tpr_at_fpr(true_labels, probabilities, 0.001)
-        tpr_fpr_01 = calculate_tpr_at_fpr(true_labels, probabilities, 0.01)
-        tpr_fpr_1 = calculate_tpr_at_fpr(true_labels, probabilities, 0.1)
-        
-        return {
-            'acc': accuracy,
-            'prec': precision,
-            'recall': recall,
-            'f1': f1,
-            'weighted_recall': weighted_recall,
-            'mcc': mcc,
-            'roc_auc': roc_auc,
-            'pr_auc': pr_auc,
-            'tpr_fpr_0001': tpr_fpr_0001,
-            'tpr_fpr_001': tpr_fpr_001,
-            'tpr_fpr_01': tpr_fpr_01,
-            'tpr_fpr_1': tpr_fpr_1
-        }
-
-    # 在标准测试集上评估
-    test_metrics = evaluate(test_loader)
-    print("\n标准测试集评估结果:")
-    for key, value in test_metrics.items():
-        print(f"{key}: {value:.4f}")
-
-    # 在对抗测试集上评估
-    test_metrics_res = evaluate(test_loader_res)
-    print("\n对抗测试集评估结果:")
-    for key, value in test_metrics_res.items():
-        print(f"{key}: {value:.4f}")
-
-    # 计算耗时
-    elapsed_time = time.time() - start_time
-    datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 4. 特定FPR的TPR
+    target_fprs = [0.0001, 0.001, 0.01, 0.1]
+    tpr_at_fpr = calculate_tpr_at_fpr(y_true, y_score, target_fprs)
     
-    # 合并指标
-    metrics = {**test_metrics, **{f"{k}_res": v for k, v in test_metrics_res.items()}}
-    metrics['elapsed_time'] = elapsed_time
-    metrics['datetime'] = datetime_str
+    # 整合并保留4位小数
+    metrics = {
+        'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp,
+        'ACC': round(acc, 4),
+        'Precision': round(precision, 4),
+        'Recall': round(recall, 4),
+        'F1': round(f1, 4),
+        'Weighted F1': round(weighted_f1, 4),
+        'MCC': round(mcc, 4),
+        'ROC-AUC': round(roc_auc, 4),
+        'PR-AUC': round(pr_auc, 4),
+        **{k: round(v, 4) for k, v in tpr_at_fpr.items()}
+    }
     
     return metrics
 
-
-# 主函数
-def main():
-    # 初始化分词器
-    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
-    max_len = 256  # 可根据实际需求调整
-
-    # 初始化指标存储
-    metrics = {
-        'acc': [], 'prec': [], 'recall': [], 'f1': [], 'weighted_recall': [],
-        'mcc': [], 'roc_auc': [], 'pr_auc': [],
-        'tpr_fpr_0001': [], 'tpr_fpr_001': [], 'tpr_fpr_01': [], 'tpr_fpr_1': [],
-        'acc_res': [], 'prec_res': [], 'recall_res': [], 'f1_res': [], 'weighted_recall_res': [],
-        'mcc_res': [], 'roc_auc_res': [], 'pr_auc_res': [],
-        'tpr_fpr_res_0001': [], 'tpr_fpr_res_001': [], 'tpr_fpr_res_01': [], 'tpr_fpr_res_1': [],
-        'datetime': [], 'elapsed_time': []
-    }
-
-    # 多轮迭代训练与评估
-    for i in range(args.iters):
-        print(f"\n===== 迭代 {i + 1}/{args.iters} =====")
-        set_seed(i)  # 不同迭代使用不同种子
-        iter_metrics = train_model(
-            tokenizer, max_len, args.n_epochs, 
-            args.batch_size, args.dataset_name, i
-        )
-        
-        # 保存本轮迭代指标
-        for key in metrics:
-            if key in iter_metrics:
-                metrics[key].append(iter_metrics[key])
-
-    # 保存结果到CSV
-    save_metrics_to_csv(metrics, args.dataset_name, args.model_name, args.iters)
-
-    # 打印平均结果
-    print("\n===== 多轮迭代平均结果 =====")
-    print("标准测试集:")
-    print(f"准确率: {np.mean(metrics['acc']):.4f} ± {np.std(metrics['acc']):.4f}")
-    print(f"F1分数: {np.mean(metrics['f1']):.4f} ± {np.std(metrics['f1']):.4f}")
-    print(f"ROC-AUC: {np.mean(metrics['roc_auc']):.4f} ± {np.std(metrics['roc_auc']):.4f}")
+# -------------------------- 6. 训练与评估函数 --------------------------
+def train_epoch(model, loader, optimizer, scheduler, criterion, epoch):
+    """训练一个epoch"""
+    model.train()
+    total_loss = 0.0
+    all_preds = []
+    all_labels = []
     
-    print("\n对抗测试集:")
-    print(f"准确率: {np.mean(metrics['acc_res']):.4f} ± {np.std(metrics['acc_res']):.4f}")
-    print(f"F1分数: {np.mean(metrics['f1_res']):.4f} ± {np.std(metrics['f1_res']):.4f}")
-    print(f"ROC-AUC: {np.mean(metrics['roc_auc_res']):.4f} ± {np.std(metrics['roc_auc_res']):.4f}")
+    progress_bar = tqdm(loader, desc=f"Train Epoch {epoch+1:2d}", leave=False)
+    for batch in progress_bar:
+        chunks = batch['chunks']
+        url_features = batch['url_features']
+        labels = batch['labels'].to(DEVICE)
+        
+        optimizer.zero_grad()
+        logits, probs = model(chunks, url_features)
+        loss = criterion(logits, labels)
+        total_loss += loss.item()
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+        
+        # 收集结果
+        preds = torch.argmax(probs, dim=1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(labels.cpu().numpy())
+        
+        progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+    
+    avg_loss = total_loss / len(loader)
+    train_acc = accuracy_score(all_labels, all_preds)
+    train_f1 = f1_score(all_labels, all_preds, average='weighted')
+    print(f"[Train] Epoch {epoch+1:2d} | Loss: {avg_loss:.4f} | Acc: {train_acc:.4f} | Weighted F1: {train_f1:.4f}")
+    
+    return avg_loss, train_acc, train_f1
 
+def eval_model(model, loader, criterion, split_name, save_preds=False, save_path=None):
+    """评估模型并返回所有指标"""
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_labels = []
+    all_scores = []  # 正类概率
+    all_urls = []    # URL列表
+    
+    with torch.no_grad():
+        progress_bar = tqdm(loader, desc=f"Eval {split_name:15s}", leave=False)
+        for batch in progress_bar:
+            chunks = batch['chunks']
+            url_features = batch['url_features']
+            labels = batch['labels'].to(DEVICE)
+            urls = batch['urls']  # 从batch中获取URL
+            
+            logits, probs = model(chunks, url_features)
+            loss = criterion(logits, labels)
+            total_loss += loss.item()
+            
+            # 收集结果
+            preds = torch.argmax(probs, dim=1).cpu().numpy()
+            scores = probs[:, 1].cpu().numpy()  # 正类（钓鱼）概率
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+            all_scores.extend(scores)
+            all_urls.extend(urls)
+            
+            progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+    
+    # 转换为numpy数组
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
+    all_scores = np.array(all_scores)
+    
+    # 计算指标
+    metrics = compute_all_metrics(all_labels, all_preds, all_scores)
+    metrics['Average Loss'] = round(total_loss / len(loader), 4)
+    
+    # 打印结果
+    print(f"\n[Eval] {split_name} Results:")
+    print("-" * 70)
+    for key, value in metrics.items():
+        print(f"{key:<20}: {value}")
+    print("-" * 70)
+    print(f"[Eval] {split_name} Classification Report:")
+    print(classification_report(all_labels, all_preds, target_names=['Legitimate(0)', 'Phishing(1)'], zero_division=0))
+    
+    # 保存预测结果
+    if save_preds and save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['URL', 'True_Label', 'Predicted_Label', 'Phishing_Probability'])
+            for url, true_lab, pred_lab, score in zip(all_urls, all_labels, all_preds, all_scores):
+                writer.writerow([url, true_lab, pred_lab, round(score, 4)])
+        print(f"[Eval] 预测结果已保存到：{save_path}\n")
+    
+    return metrics
 
+# -------------------------- 7. 结果保存函数 --------------------------
+def save_metrics_to_csv(args, metrics_dict):
+    """将所有数据集的指标保存到CSV"""
+    os.makedirs(os.path.dirname(args.metrics_save_path), exist_ok=True)
+    
+    # 表头：基础信息 + 所有指标
+    base_cols = ['Timestamp', 'Dataset', 'Aggregation', 'Max_Len', 'Batch_Size', 'Epochs', 'Split']
+    metric_cols = list(next(iter(metrics_dict.values())).keys())
+    headers = base_cols + metric_cols
+    
+    # 检查文件是否存在（不存在则写表头）
+    file_exists = os.path.exists(args.metrics_save_path)
+    
+    with open(args.metrics_save_path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        if not file_exists:
+            writer.writeheader()
+        
+        # 写入每个分割的指标
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for split, metrics in metrics_dict.items():
+            row = {
+                'Timestamp': timestamp,
+                'Dataset': args.dataset_name,
+                'Aggregation': args.aggregation,
+                'Max_Len': args.max_len,
+                'Batch_Size': args.batch_size,
+                'Epochs': args.epochs,
+                'Split': split,
+                **metrics
+            }
+            writer.writerow(row)
+    
+    print(f"\n[Save] 所有评估指标已保存到：{args.metrics_save_path}")
+
+# -------------------------- 8. 主训练流程 --------------------------
+def main(args):
+    # 1. 初始化设置
+    set_seed(args.seed)
+    os.makedirs(os.path.dirname(args.model_save_path), exist_ok=True)
+    os.makedirs(args.pred_save_dir, exist_ok=True)
+    
+    # 2. 加载Tokenizer
+    print(f"\n[Model] 加载RoBERTa Tokenizer（max_len={args.max_len}）")
+    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+    
+    # 3. 创建DataLoader
+    train_loader, val_loader, test_loader, adv_test_loader = create_dataloaders(args, tokenizer)
+    
+    # 4. 初始化模型、损失函数、优化器
+    print(f"\n[Model] 初始化模型（聚合策略：{args.aggregation}）")
+    model = RobertaWebClassifier(aggregation_strategy=args.aggregation)
+    model.to(DEVICE)
+    print(f"[Model] 模型参数总数：{sum(p.numel() for p in model.parameters()):,}")
+    
+    # 类别权重（处理类别不平衡）
+    train_labels = [label for batch in train_loader for label in batch['labels'].numpy()]
+    class_counts = np.bincount(train_labels)
+    class_weights = torch.tensor([len(train_labels)/count for count in class_counts], dtype=torch.float32).to(DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    print(f"[Train] 类别权重：{class_weights.cpu().numpy()}")
+    
+    # 优化器与调度器
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+    total_steps = len(train_loader) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=0.1 * total_steps,
+        num_training_steps=total_steps
+    )
+    
+    # 5. 开始训练
+    print(f"\n[Train] 开始训练（共{args.epochs}轮）")
+    print("=" * 80)
+    best_val_f1 = 0.0
+    train_history = []
+    val_history = []
+    
+    for epoch in range(args.epochs):
+        # 训练
+        train_loss, train_acc, train_f1 = train_epoch(model, train_loader, optimizer, scheduler, criterion, epoch)
+        train_history.append({'loss': train_loss, 'acc': train_acc, 'f1': train_f1})
+        
+        # 验证
+        val_metrics = eval_model(model, val_loader, criterion, split_name="Validation")
+        val_history.append(val_metrics)
+        current_val_f1 = val_metrics['F1']
+        
+        # 保存最优模型（基于验证集F1）
+        if current_val_f1 > best_val_f1:
+            best_val_f1 = current_val_f1
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_f1': best_val_f1,
+                'args': args,
+                'train_history': train_history,
+                'val_history': val_history
+            }, args.model_save_path)
+            print(f"[Save] 最优模型已保存（验证集F1：{best_val_f1:.4f}）\n")
+        print("=" * 80)
+    
+    # 6. 加载最优模型进行最终评估
+    print(f"\n[Eval] 加载最优模型进行最终评估（验证集最佳F1：{best_val_f1:.4f}）")
+    print("=" * 80)
+    checkpoint = torch.load(args.model_save_path, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # 评估所有数据集
+    final_metrics = {}
+    # 训练集
+    final_metrics['Train'] = eval_model(model, train_loader, criterion, split_name="Final_Train")
+    # 验证集
+    final_metrics['Validation'] = eval_model(model, val_loader, criterion, split_name="Final_Validation")
+    # 测试集（保存预测结果）
+    test_pred_path = os.path.join(args.pred_save_dir, f"{args.dataset_name}_test_preds.csv")
+    final_metrics['Test'] = eval_model(model, test_loader, criterion, split_name="Final_Test", save_preds=True, save_path=test_pred_path)
+    # 对抗性测试集（保存预测结果）
+    adv_pred_path = os.path.join(args.pred_save_dir, f"{args.dataset_name}_adv_test_preds.csv")
+    final_metrics['Adversarial_Test'] = eval_model(model, adv_test_loader, criterion, split_name="Final_Adversarial_Test", save_preds=True, save_path=adv_pred_path)
+    
+    # 7. 保存所有指标到CSV
+    save_metrics_to_csv(args, final_metrics)
+    
+    # 8. 打印训练总结
+    print("\n" + "=" * 80)
+    print("训练总结")
+    print("=" * 80)
+    print(f"数据集：{args.dataset_name}")
+    print(f"模型配置：max_len={args.max_len} | batch_size={args.batch_size} | 聚合策略={args.aggregation} | 学习率={args.lr}")
+    print(f"最优验证集F1：{best_val_f1:.4f}")
+    print(f"测试集关键指标：F1={final_metrics['Test']['F1']:.4f} | ROC-AUC={final_metrics['Test']['ROC-AUC']:.4f} | MCC={final_metrics['Test']['MCC']:.4f}")
+    print(f"对抗性测试集F1：{final_metrics['Adversarial_Test']['F1']:.4f}")
+    print("=" * 80)
+
+# -------------------------- 9. 入口函数（直接运行） --------------------------
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    print("=" * 80)
+    print("Sheepdog 钓鱼检测模型（长文本分段+完整评估指标）")
+    print("=" * 80)
+    print("运行参数：")
+    for k, v in vars(args).items():
+        print(f"  {k:<20}: {v}")
+    print("=" * 80)
+    
+    try:
+        main(args)
+        print("\n训练完成！所有结果已保存到指定路径～")
+    except Exception as e:
+        print(f"\n运行出错：{str(e)}")
+        raise e
